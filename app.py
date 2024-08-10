@@ -1,14 +1,22 @@
 from flask import Flask, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_marshmallow import Marshmallow
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from sqlalchemy.exc import IntegrityError
+from datetime import timedelta
+
 
 app = Flask(__name__)
 
 #Connect to Database                    DBMS     DB_DRIVER  DB_USER DB_PWD   URL     PORT  DB_NAME
 app.config["SQLALCHEMY_DATABASE_URI"] = "postgresql+psycopg2://dazza:dazza@localhost:5432/flaskdb"
+app.config["JWT_SECRET_KEY"] = "secret"
 
 db = SQLAlchemy(app)
 ma = Marshmallow(app)
+bcrypt = Bcrypt(app)
+jwt = JWTManager(app)
 
 #Create a Model of a table
 class Product(db.Model):
@@ -33,7 +41,66 @@ products_schema = ProductSchema(many=True)
 #to handle a single product
 product_schema = ProductSchema() 
 
+class User(db.Model):
+    __tablename__ = "users"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100))
+    email = db.Column(db.String, nullable=False, unique=True)
+    password = db.Column(db.String, nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
 
+class UserSchema(ma.Schema):
+    class Meta:
+        fields = ("id", "name", "email", "password", "is_admin" )
+
+users_schema = UserSchema(many=True, exclude=["password"])
+
+user_schema = UserSchema(exclude=["password"])
+
+@app.route("/auth/register", methods=["POST"])
+def register_user():
+    try:
+        #body of request
+        body_data = request.get_json()
+        #extracting the password from the body of the request
+        password = body_data.get("password")
+        #Hashing the password
+        hashed_password = bcrypt.generate_password_hash(password).decode('utf8')
+        #create a user , using the User model
+        user = User(
+            name = body_data.get("name"),
+            email = body_data.get("email"),
+            password = hashed_password
+        )
+        #add it to the db session
+        db.session.add(user)
+        #commit
+        db.session.commit()
+        # Return something
+        return user_schema.dump(user), 201
+    except IntegrityError:
+        return {"error": "This email already exists"}, 400
+    
+@app.route("/auth/login", methods=["POST"])
+def login_user():
+    #Find the user with tht email
+    body_data = request.get_json()
+    #If the user exists and the password matches
+
+    stmt = db.select(User).filter_by(email=body_data.get("email"))
+    user = db.session.scalar(stmt)
+    #Create a jwt token
+    if user and bcrypt.check_password_hash(user.password, body_data.get("password")):
+        token = create_access_token(identity=str(user.id), expires_delta=timedelta(days=1))
+        return {"token": token, "email": user.email, "is_admin": user.is_admin}
+    else:
+        return {"error": "Invalid email or password"}, 401
+
+    # return the token
+
+    #else
+    #return an error message
+        
 # CLI Commands - Custom
 @app.cli.command("create")
 def create_table():
@@ -63,6 +130,22 @@ def seed_tables():
     #2nd way could be
     # products = [product1, product2]
     # db.session.add_all(products)
+
+    users = [
+        User(
+            name = "User 1",
+            email = "user1@gmail.com",
+            password = bcrypt.generate_password_hash("123456").decode('utf8')
+        ),
+        User(
+            
+            email = "admin1@gmail.com",
+            password = bcrypt.generate_password_hash("abc123").decode('utf8'),
+            is_admin = True
+        )
+    ]
+
+    db.session.add_all(users)
 
     # Commit it
     db.session.commit()
@@ -105,6 +188,7 @@ def get_product(product_id):
 # /products/id, DELETE --> delete a specific product
 #ADD
 @app.route("/products", methods=["POST"])
+@jwt_required()
 def add_products():
     product_fields = request.get_json()
     new_product = Product(
@@ -140,7 +224,13 @@ def update_product(product_id):
     
 # DELETE
 @app.route("/products/<int:product_id>", methods=["DELETE"])
+@jwt_required()
 def delete_product(product_id):
+
+    is_admin = authoriseAsAdmin()
+    if not is_admin:
+        return {"error": "Not authorised to delete a product"}, 403
+    
     stmt = db.select(Product).filter_by(id=product_id)
     product = db.session.scalar(stmt)
 
@@ -150,6 +240,15 @@ def delete_product(product_id):
         return {"message": f"Product with id {product_id} is deleted."}
     else:
         return {"error" : f"Product with id {product_id} doesnt exist"}, 404
+    
+def authoriseAsAdmin():
+    #get the id of the user from the jwt token
+    user_id = get_jwt_identity()
+    # find the user in the db with the id
+    stmt = db.select(User).filter_by(id=user_id)
+    user = db.session.scalar(stmt)
+    #check whether the user is an admin or not
+    return user.is_admin
 
 
 
